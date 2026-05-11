@@ -1,0 +1,32 @@
+# Virtual environments
+rtdetr_env/
+.venv/
+venv/
+env/
+
+# PaddleDetection is cloned separately (see README)
+PaddleDetection/
+
+# Large binaries and media (download per README)
+*.pdparams
+*.mp4
+*.avi
+*.mkv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
