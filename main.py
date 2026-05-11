@@ -122,56 +122,159 @@ def global_id_bgr(gid):
 
 
 class GlobalIdentityRegistry:
-    """Maps local StrongSORT IDs to one shared global ID using Re-ID embeddings (OSNet)."""
+    """
+    Maintains a single shared Global ID (GID) for the same person across cameras.
 
-    def __init__(self, sim_thresh=0.52, ema_alpha=0.2):
+    Key properties:
+      * Each local StrongSORT track ``(cam_id, track_id)`` is *sticky-bound*
+        to a GID for the lifetime of that local track. A single low-similarity
+        frame (occlusion, blur, side view) no longer triggers a new GID.
+      * The gallery stores a separate running EMA embedding per camera per
+        GID. Cross-view matching uses the max similarity across all stored
+        per-camera views, so a person seen from very different angles in
+        cam1 vs cam2 can still be merged.
+      * New (not yet sticky-bound) tracks are matched to existing GIDs via
+        Hungarian assignment on cosine similarity, with the constraint that
+        two active local tracks in the same camera cannot share a GID.
+      * Sticky bindings whose owning local track disappears for more than
+        ``stale_frames`` are pruned so GIDs can be re-used.
+    """
+
+    def __init__(self, sim_thresh=0.52, ema_alpha=0.2, stale_frames=300):
         self.sim_thresh = sim_thresh
         self.ema_alpha = ema_alpha
+        self.stale_frames = stale_frames
         self._next_gid = 1
+        # gid -> {"views_by_cam": {cam_id: np.ndarray}, "last_seen": int}
         self._gallery = {}
+        # (cam_id, track_id) -> {"gid": int, "last_seen": int}
+        self._track_to_gid = {}
+        self._frame = 0
+
+    def _all_views(self, gid):
+        return list(self._gallery[gid]["views_by_cam"].values())
+
+    def _best_sim(self, emb, gid):
+        sims = [embedding_cosine_similarity(emb, v) for v in self._all_views(gid)]
+        return max(sims) if sims else -1.0
+
+    def _update_views(self, gid, emb, cam_id):
+        g = self._gallery[gid]
+        existing = g["views_by_cam"].get(cam_id)
+        if existing is None:
+            g["views_by_cam"][cam_id] = emb.copy()
+        else:
+            merged = (1.0 - self.ema_alpha) * existing + self.ema_alpha * emb
+            nrm = float(np.linalg.norm(merged)) + 1e-12
+            g["views_by_cam"][cam_id] = (merged / nrm).astype(np.float32)
+        g["last_seen"] = self._frame
+
+    def _busy_gids_for_cam(self, cam_id):
+        """GIDs already bound to an active sticky track in ``cam_id``."""
+        return {
+            info["gid"]
+            for k, info in self._track_to_gid.items()
+            if k[0] == cam_id
+        }
+
+    @staticmethod
+    def _greedy_assignment(sim):
+        rows, cols = sim.shape
+        flat = [(sim[r, c], r, c) for r in range(rows) for c in range(cols)]
+        flat.sort(key=lambda x: -x[0])
+        used_r, used_c = set(), set()
+        ri, ci = [], []
+        for _, r, c in flat:
+            if r in used_r or c in used_c:
+                continue
+            ri.append(r)
+            ci.append(c)
+            used_r.add(r)
+            used_c.add(c)
+        return np.asarray(ri, dtype=np.int64), np.asarray(ci, dtype=np.int64)
 
     def assign(self, observations):
         """
         observations: iterable of dict(cam_id, track_id, bbox, emb)
         emb: L2-normalized OSNet feature (same space as StrongSORT).
-        Returns mapping (cam_id, track_id) -> global_id
+        Returns mapping (cam_id, track_id) -> global_id.
         """
-        obs_list = list(observations)
-        obs_list.sort(key=lambda o: -bbox_area(o["bbox"]))
+        self._frame += 1
         gid_map = {}
-        used_gids = set()
+        used_gids_this_frame = set()
+        new_obs = []  # tracks lacking a sticky GID
 
-        for obs in obs_list:
-            cam_id = obs["cam_id"]
-            tid = int(obs["track_id"])
+        # Phase 1: keep sticky bindings for tracks we've already seen.
+        for obs in observations:
+            key = (obs["cam_id"], int(obs["track_id"]))
             emb = np.asarray(obs["emb"], dtype=np.float32).ravel()
-            candidates = []
-            for gid, pdata in self._gallery.items():
-                sim = embedding_cosine_similarity(emb, pdata["emb"])
-                if sim >= self.sim_thresh:
-                    candidates.append((sim, gid))
-            candidates.sort(key=lambda x: (-x[0], x[1]))
-
-            chosen_gid = None
-            for _sim, cand_gid in candidates:
-                if cand_gid not in used_gids:
-                    chosen_gid = cand_gid
-                    break
-
-            if chosen_gid is not None:
-                gid = chosen_gid
-                used_gids.add(gid)
-                oh = self._gallery[gid]["emb"]
-                merged = (1.0 - self.ema_alpha) * oh + self.ema_alpha * emb
-                nrm = np.linalg.norm(merged) + 1e-12
-                self._gallery[gid]["emb"] = (merged / nrm).astype(np.float32)
+            sticky = self._track_to_gid.get(key)
+            if sticky is not None:
+                gid = sticky["gid"]
+                sticky["last_seen"] = self._frame
+                self._update_views(gid, emb, obs["cam_id"])
+                gid_map[key] = gid
+                used_gids_this_frame.add(gid)
             else:
-                gid = self._next_gid
-                self._next_gid += 1
-                used_gids.add(gid)
-                self._gallery[gid] = {"emb": emb.copy()}
+                new_obs.append((obs, emb))
 
-            gid_map[(cam_id, tid)] = gid
+        # Phase 2: match new tracks to existing GIDs via Hungarian assignment.
+        candidate_gids = [g for g in self._gallery if g not in used_gids_this_frame]
+        unassigned_rows = set(range(len(new_obs)))
+
+        if new_obs and candidate_gids:
+            rows, cols = len(new_obs), len(candidate_gids)
+            sim = np.full((rows, cols), -1.0, dtype=np.float32)
+            for i, (obs, emb) in enumerate(new_obs):
+                cam_busy = self._busy_gids_for_cam(obs["cam_id"])
+                for j, gid in enumerate(candidate_gids):
+                    if gid in cam_busy:
+                        # Same-camera exclusivity: two local tracks in the
+                        # same camera cannot share a GID.
+                        continue
+                    sim[i, j] = self._best_sim(emb, gid)
+
+            try:
+                from scipy.optimize import linear_sum_assignment
+                row_ind, col_ind = linear_sum_assignment(-sim)
+            except ImportError:
+                row_ind, col_ind = self._greedy_assignment(sim)
+
+            for r, c in zip(row_ind, col_ind):
+                if r >= rows or c >= cols:
+                    continue
+                if sim[r, c] < self.sim_thresh:
+                    continue
+                gid = candidate_gids[c]
+                obs, emb = new_obs[r]
+                key = (obs["cam_id"], int(obs["track_id"]))
+                self._track_to_gid[key] = {"gid": gid, "last_seen": self._frame}
+                self._update_views(gid, emb, obs["cam_id"])
+                gid_map[key] = gid
+                used_gids_this_frame.add(gid)
+                unassigned_rows.discard(r)
+
+        # Phase 3: anything still unmatched gets a brand-new GID.
+        for r in sorted(unassigned_rows):
+            obs, emb = new_obs[r]
+            key = (obs["cam_id"], int(obs["track_id"]))
+            gid = self._next_gid
+            self._next_gid += 1
+            self._gallery[gid] = {
+                "views_by_cam": {obs["cam_id"]: emb.copy()},
+                "last_seen": self._frame,
+            }
+            self._track_to_gid[key] = {"gid": gid, "last_seen": self._frame}
+            gid_map[key] = gid
+            used_gids_this_frame.add(gid)
+
+        # Phase 4: prune sticky bindings whose owners have vanished.
+        stale = [
+            k for k, info in self._track_to_gid.items()
+            if self._frame - info["last_seen"] > self.stale_frames
+        ]
+        for k in stale:
+            del self._track_to_gid[k]
 
         return gid_map
 
@@ -241,14 +344,212 @@ global_registry = GlobalIdentityRegistry(
     sim_thresh=_GLOBAL_REID_COSINE_THRESH,
     ema_alpha=0.2,
 )
+
+
+def _parse_zone_rect(env_value, default):
+    """Parse 'x1,y1,x2,y2' in normalized [0,1] coords. Returns (x1,y1,x2,y2)."""
+    raw = os.environ.get(env_value)
+    if not raw:
+        return default
+    try:
+        parts = [float(p.strip()) for p in raw.split(",")]
+        if len(parts) != 4:
+            raise ValueError
+        x1, y1, x2, y2 = parts
+        x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+        y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+        return (x1, y1, x2, y2)
+    except (ValueError, TypeError):
+        print(
+            f"[WARN] {env_value}={raw!r} is invalid (expected 'x1,y1,x2,y2' "
+            f"in [0,1]); falling back to default {default}."
+        )
+        return default
+
+
+# Defaults assume people walk roughly left-to-right between cameras:
+#   cam1 exit  = right strip of cam1 (x in [0.70, 1.00], full height)
+#   cam2 entry = left  strip of cam2 (x in [0.00, 0.30], full height)
+# Override with env vars CAM1_EXIT_ZONE / CAM2_ENTRY_ZONE as 'x1,y1,x2,y2'
+# in normalized [0,1] coordinates.
+ZONES = {
+    "cam1": {
+        "label": "EXIT (-> cam2)",
+        "rect_norm": _parse_zone_rect("CAM1_EXIT_ZONE", (0.00, 0.00, 0.55, 1.00)),
+        "color_bgr": (0, 80, 220),   # red-ish
+    },
+    "cam2": {
+        "label": "ENTRY (<- cam1)",
+        "rect_norm": _parse_zone_rect("CAM2_ENTRY_ZONE", (0.50, 0.00, 1.00, 1.00)),
+        "color_bgr": (0, 200, 80),   # green-ish
+    },
+}
+
+
+def draw_zone(frame, zone, alpha=0.25):
+    """Translucent fill + outline + label for a normalized rectangle zone."""
+    h, w = frame.shape[:2]
+    x1n, y1n, x2n, y2n = zone["rect_norm"]
+    x1, y1 = int(round(x1n * w)), int(round(y1n * h))
+    x2, y2 = int(round(x2n * w)), int(round(y2n * h))
+    if x2 <= x1 or y2 <= y1:
+        return
+    color = zone["color_bgr"]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=2)
+    label = zone["label"]
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    pad = 4
+    tx, ty = x1 + pad, y1 + th + pad
+    cv2.rectangle(
+        frame,
+        (tx - pad, ty - th - pad),
+        (tx + tw + pad, ty + pad),
+        color,
+        thickness=-1,
+    )
+    cv2.putText(
+        frame,
+        label,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def bbox_in_zone(bbox, zone, frame_shape):
+    """True if the bbox's bottom-center (foot point) is inside the zone."""
+    h, w = frame_shape[:2]
+    x1n, y1n, x2n, y2n = zone["rect_norm"]
+    zx1, zy1 = x1n * w, y1n * h
+    zx2, zy2 = x2n * w, y2n * h
+    bx1, by1, bx2, by2 = bbox
+    cx = 0.5 * (bx1 + bx2)
+    cy = by2  # foot point on the ground plane
+    return zx1 <= cx <= zx2 and zy1 <= cy <= zy2
+
+
+class HandoffEventLogger:
+    """
+    Detects cross-camera handoff events from per-camera local-track lifecycles
+    inside each camera's handoff zone, and reports them with the assigned GID.
+
+    Events (per camera, bidirectional):
+      * ENTRY: a brand-new local track first appears inside the handoff zone
+               -> the person likely arrived FROM the other camera.
+      * EXIT:  a local track stops being tracked while its last known
+               position was inside the handoff zone -> the person likely
+               left TO the other camera.
+
+    A track that was gone longer than ``vanish_frames`` is treated as a new
+    lifecycle on next sighting, which correctly handles StrongSORT ID recycling.
+    """
+
+    def __init__(self, vanish_frames=10, entry_grace_frames=3):
+        self.vanish_frames = int(vanish_frames)
+        self.entry_grace_frames = int(entry_grace_frames)
+        self._state = {}  # (cam_id, track_id) -> dict
+        self._frame = 0
+
+    def begin_frame(self):
+        self._frame += 1
+        return self._frame
+
+    def observe(self, cam_id, track_id, gid, in_zone):
+        """Record a per-track observation; returns any newly fired events."""
+        key = (cam_id, int(track_id))
+        st = self._state.get(key)
+        if st is not None and self._frame - st["last_seen_frame"] > self.vanish_frames:
+            # Track was gone long enough that we treat this sighting as a
+            # fresh lifecycle (StrongSORT may recycle local track ids).
+            st = None
+
+        events = []
+        if st is None:
+            st = {
+                "first_seen_frame": self._frame,
+                "last_seen_frame": self._frame,
+                "first_in_zone": bool(in_zone),
+                "last_in_zone": bool(in_zone),
+                "last_gid": gid,
+                "entry_logged": False,
+                "exit_logged": False,
+            }
+            self._state[key] = st
+            if in_zone and gid is not None:
+                events.append(("ENTRY", cam_id, gid, self._frame))
+                st["entry_logged"] = True
+        else:
+            st["last_seen_frame"] = self._frame
+            st["last_in_zone"] = bool(in_zone)
+            if gid is not None:
+                st["last_gid"] = gid
+            # Retroactive grace window: if the very first sighting was in
+            # zone but the GID hadn't been assigned yet, log ENTRY now.
+            if (
+                in_zone
+                and gid is not None
+                and not st["entry_logged"]
+                and st["first_in_zone"]
+                and self._frame - st["first_seen_frame"] <= self.entry_grace_frames
+            ):
+                events.append(("ENTRY", cam_id, gid, self._frame))
+                st["entry_logged"] = True
+            st["exit_logged"] = False  # alive again
+        return events
+
+    def sweep_exits(self):
+        """Call after all cameras processed for the frame; logs vanished tracks."""
+        events = []
+        stale_keys = []
+        for key, st in self._state.items():
+            if st["exit_logged"]:
+                if self._frame - st["last_seen_frame"] > 10 * self.vanish_frames:
+                    stale_keys.append(key)
+                continue
+            if self._frame - st["last_seen_frame"] >= self.vanish_frames:
+                if st["last_in_zone"] and st["last_gid"] is not None:
+                    events.append(
+                        ("EXIT", key[0], st["last_gid"], st["last_seen_frame"])
+                    )
+                st["exit_logged"] = True
+        for k in stale_keys:
+            del self._state[k]
+        return events
+
+
+def _print_handoff_events(events):
+    for kind, cam_id, gid, frame_idx in events:
+        # Pad kind to 5 chars so EXIT/ENTRY line up in the terminal.
+        print(f"[HANDOFF f={frame_idx:>5}] {cam_id} {kind:<5} GID:{gid}")
 print(
     f"[INFO] StrongSORT (BoxMOT) enabled — shared Re-ID backend, "
     f"device {_STRONGSORT_DEVICE}. "
     f"Optional: STRONGSORT_REID_WEIGHTS / STRONGSORT_DEVICE env vars."
 )
 print(
-    f"[INFO] Same person ID across cam1/cam2: OSNet embeddings "
-    f"(cosine ≥ {_GLOBAL_REID_COSINE_THRESH}; tune GLOBAL_REID_COSINE_THRESH)."
+    f"[INFO] Shared GID across cam1/cam2 via OSNet Re-ID "
+    f"(cosine ≥ {_GLOBAL_REID_COSINE_THRESH}; tune GLOBAL_REID_COSINE_THRESH). "
+    f"Sticky per-track binding + multi-view gallery + Hungarian matching."
+)
+print(
+    "[INFO] Handoff zones (normalized x1,y1,x2,y2): "
+    f"cam1 EXIT={ZONES['cam1']['rect_norm']}, "
+    f"cam2 ENTRY={ZONES['cam2']['rect_norm']}. "
+    "Override with CAM1_EXIT_ZONE / CAM2_ENTRY_ZONE env vars."
+)
+
+_HANDOFF_VANISH_FRAMES = int(os.environ.get("HANDOFF_VANISH_FRAMES", "10"))
+handoff_logger = HandoffEventLogger(vanish_frames=_HANDOFF_VANISH_FRAMES)
+print(
+    f"[INFO] Handoff logger active (vanish_frames={_HANDOFF_VANISH_FRAMES}); "
+    "ENTRY/EXIT events with GID are reported to this terminal "
+    "(works both cam1->cam2 and cam2->cam1)."
 )
 
 def preprocess(frame):
@@ -335,19 +636,32 @@ while True:
         display_batch.append((cam_id, frame, tracks))
 
     gid_map = global_registry.assign(pending_observations)
+    handoff_logger.begin_frame()
 
     for cam_id, frame, tracks in display_batch:
+        zone = ZONES.get(cam_id)
+        if zone is not None:
+            draw_zone(frame, zone)
+
         for track in tracks:
             x1, y1, x2, y2 = map(int, track[:4])
             tid = int(track[4])
             gid = gid_map.get((cam_id, tid))
             color = global_id_bgr(gid) if gid is not None else (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = (
-                f"ID:{gid}"
-                if gid is not None
-                else f"{cam_id} L{tid}"
+            in_zone = zone is not None and bbox_in_zone(
+                (x1, y1, x2, y2), zone, frame.shape
             )
+            if zone is not None:
+                _print_handoff_events(
+                    handoff_logger.observe(cam_id, tid, gid, in_zone)
+                )
+            base = f"GID:{gid}" if gid is not None else f"{cam_id} L{tid}"
+            if in_zone:
+                marker = "EXIT" if cam_id == "cam1" else "ENTRY"
+                label = f"{base} [{marker}]"
+            else:
+                label = base
             cv2.putText(
                 frame,
                 label,
@@ -359,6 +673,8 @@ while True:
             )
 
         cv2.imshow(cam_id, frame)
+
+    _print_handoff_events(handoff_logger.sweep_exits())
 
     if cv2.waitKey(max(1, int(1000 / TARGET_FPS))) == 27:
         break
