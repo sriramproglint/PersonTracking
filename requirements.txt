@@ -17,7 +17,10 @@ ftfy>=6.1,<7
 yacs>=0.1,<1
 huggingface-hub>=1.7.1
 filelock>=3
+# On DGX Spark (aarch64) pip only provides CPU paddle; build GPU wheel first:
+#   bash scripts/build_paddle_gpu_dgx_spark.sh
 paddlepaddle
+nvidia-cudnn-cu13
 PyYAML
 pycocotools==2.0.8
 requests
@@ -27,3 +30,4 @@ shapely
 terminaltables
 imgaug>=0.4.0
 pandas
+openpyxl>=3.1,<4

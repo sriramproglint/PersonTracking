@@ -13,6 +13,10 @@ PaddleDetection/
 *.avi
 *.mkv
 
+# Local CUDA lib shims (generated at runtime)
+.cuda_shim/
+lib64/
+
 # Python
 __pycache__/
 *.py[cod]

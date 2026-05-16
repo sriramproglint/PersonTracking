@@ -1,0 +1,20 @@
+# install brew if not already
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# python (recommended 3.10)
+brew install python@3.10
+
+# create venv
+python3 -m venv rtdetr_env
+source rtdetr_env/bin/activate
+
+pip install --upgrade pip
+
+# PyTorch (Apple Silicon build)
+pip install torch torchvision torchaudio
+
+# Core libs
+pip install opencv-python numpy scipy scikit-learn
+
+# Tracking dependencies
+pip install filterpy lap
